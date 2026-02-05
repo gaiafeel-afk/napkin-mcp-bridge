@@ -155,6 +155,19 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'napkin-mcp-bridge' });
 });
 
+// MCP discovery endpoint (GET) - required for Claude.ai
+app.get('/mcp', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.json({
+    name: "napkin-mcp-bridge",
+    version: "1.0.0",
+    protocol_version: PROTOCOL_VERSION,
+    capabilities: {
+      tools: {}
+    }
+  });
+});
+
 // MCP endpoint - Streamable HTTP transport
 app.post('/mcp', async (req, res) => {
   // Get or create session
