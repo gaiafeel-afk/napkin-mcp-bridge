@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const { randomUUID } = require('crypto');
+const archiver = require('archiver');
 
 const app = express();
 app.use(cors({
@@ -12,7 +13,9 @@ app.use(cors({
 app.use(express.json());
 
 const NAPKIN_API_KEY = process.env.NAPKIN_API_KEY;
+const BASE_URL = process.env.BASE_URL || ''; // e.g., https://your-app.railway.app
 const sessions = new Map();
+const imageStore = new Map(); // Store generated images temporarily
 
 // MCP Protocol version
 const PROTOCOL_VERSION = "2024-11-05";
@@ -21,7 +24,7 @@ const PROTOCOL_VERSION = "2024-11-05";
 const TOOLS = [
   {
     name: "generate_visual",
-    description: "Generate infographics and visuals using Napkin AI. Creates mindmaps, flowcharts, timelines, comparisons, and more from text content.",
+    description: "Generate infographics and visuals using Napkin AI. Creates mindmaps, flowcharts, timelines, comparisons, and more from text content. Returns the image displayed inline plus a download ID for bundling.",
     inputSchema: {
       type: "object",
       properties: {
@@ -38,10 +41,29 @@ const TOOLS = [
           type: "string",
           description: "Output format",
           enum: ["svg", "png"],
-          default: "svg"
+          default: "png"
+        },
+        filename: {
+          type: "string",
+          description: "Optional filename for the image (without extension)"
         }
       },
       required: ["content"]
+    }
+  },
+  {
+    name: "bundle_images",
+    description: "Bundle multiple generated images into a downloadable ZIP file. Use after generating visuals with generate_visual.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        image_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: "Array of image IDs returned from generate_visual calls"
+        }
+      },
+      required: ["image_ids"]
     }
   }
 ];
@@ -68,7 +90,7 @@ async function handleMcpRequest(request, sessionId) {
         },
         serverInfo: {
           name: "napkin-mcp-bridge",
-          version: "1.0.0"
+          version: "1.1.0"
         }
       });
 
@@ -84,34 +106,32 @@ async function handleMcpRequest(request, sessionId) {
       if (name === "generate_visual") {
         try {
           const result = await generateNapkinVisual(args);
-          
-          // Handle different return types (image vs text)
-          if (result.type === "image") {
-            return jsonRpcResponse(id, {
-              content: [
-                {
-                  type: "image",
-                  data: result.data,
-                  mimeType: result.mimeType
-                }
-              ]
-            });
-          } else if (result.type === "text") {
-            return jsonRpcResponse(id, {
-              content: [{ type: "text", text: result.text }]
-            });
-          } else {
-            // Legacy string return
-            return jsonRpcResponse(id, {
-              content: [{ type: "text", text: result }]
-            });
-          }
+          return jsonRpcResponse(id, { content: result.content });
         } catch (error) {
           return jsonRpcResponse(id, {
             content: [
               {
                 type: "text",
                 text: `Error generating visual: ${error.message}`
+              }
+            ],
+            isError: true
+          });
+        }
+      }
+      
+      if (name === "bundle_images") {
+        try {
+          const result = await bundleImages(args);
+          return jsonRpcResponse(id, {
+            content: [{ type: "text", text: result }]
+          });
+        } catch (error) {
+          return jsonRpcResponse(id, {
+            content: [
+              {
+                type: "text",
+                text: `Error bundling images: ${error.message}`
               }
             ],
             isError: true
@@ -134,9 +154,42 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Bundle images into zip
+async function bundleImages(args) {
+  const { image_ids } = args;
+  
+  if (!image_ids || image_ids.length === 0) {
+    throw new Error("No image IDs provided");
+  }
+
+  // Validate all images exist
+  const images = [];
+  for (const id of image_ids) {
+    const img = imageStore.get(id);
+    if (!img) {
+      throw new Error(`Image not found: ${id}. Images expire after 1 hour.`);
+    }
+    images.push({ id, ...img });
+  }
+
+  // Create bundle ID
+  const bundleId = randomUUID();
+  
+  // Store bundle reference
+  imageStore.set(`bundle_${bundleId}`, {
+    type: 'bundle',
+    imageIds: image_ids,
+    created: Date.now()
+  });
+
+  const downloadUrl = BASE_URL ? `${BASE_URL}/download/zip/${bundleId}` : `/download/zip/${bundleId}`;
+  
+  return `✅ Bundle created with ${images.length} images!\n\n🔗 Download ZIP: ${downloadUrl}\n\nImages included:\n${images.map((img, i) => `${i + 1}. ${img.filename}`).join('\n')}\n\n⚠️ Link expires in 1 hour.`;
+}
+
 // Call Napkin AI API (async with polling)
 async function generateNapkinVisual(args) {
-  const { content, visual_type, format = "svg" } = args;
+  const { content, visual_type, format = "png", filename } = args;
 
   // Step 1: Create visual request
   const createResponse = await fetch("https://api.napkin.ai/v1/visual", {
@@ -195,7 +248,9 @@ async function generateNapkinVisual(args) {
       }
       
       if (!fileUrl) {
-        return { type: "text", text: `✅ Visual completed but no download URL found. Response: ${JSON.stringify(statusData)}` };
+        return { 
+          content: [{ type: "text", text: `✅ Visual completed but no download URL found. Response: ${JSON.stringify(statusData)}` }]
+        };
       }
 
       // Download the file with auth header
@@ -206,18 +261,44 @@ async function generateNapkinVisual(args) {
       });
 
       if (!fileResponse.ok) {
-        return { type: "text", text: `✅ Visual generated but failed to download: ${fileResponse.status}. URL: ${fileUrl}` };
+        return { 
+          content: [{ type: "text", text: `✅ Visual generated but failed to download: ${fileResponse.status}. URL: ${fileUrl}` }]
+        };
       }
 
       const contentType = fileResponse.headers.get('content-type') || 'image/png';
       const arrayBuffer = await fileResponse.arrayBuffer();
-      const base64 = Buffer.from(arrayBuffer).toString('base64');
+      const buffer = Buffer.from(arrayBuffer);
+      const base64 = buffer.toString('base64');
+      const mimeType = contentType.split(';')[0];
       
-      // Return as image for MCP
+      // Generate image ID and store
+      const imageId = randomUUID().slice(0, 8);
+      const ext = mimeType.includes('svg') ? 'svg' : (mimeType.includes('png') ? 'png' : 'jpg');
+      const finalFilename = filename ? `${filename}.${ext}` : `napkin_${imageId}.${ext}`;
+      
+      imageStore.set(imageId, {
+        data: buffer,
+        mimeType: mimeType,
+        filename: finalFilename,
+        created: Date.now()
+      });
+
+      const downloadUrl = BASE_URL ? `${BASE_URL}/download/${imageId}` : `/download/${imageId}`;
+      
+      // Return image + text with download info
       return {
-        type: "image",
-        data: base64,
-        mimeType: contentType.split(';')[0]
+        content: [
+          {
+            type: "image",
+            data: base64,
+            mimeType: mimeType
+          },
+          {
+            type: "text",
+            text: `📎 Image ID: \`${imageId}\`\n🔗 Direct download: ${downloadUrl}\n📁 Filename: ${finalFilename}`
+          }
+        ]
       };
     } else if (status === "failed" || status === "error") {
       throw new Error(`Visual generation failed: ${statusData.error || "Unknown error"}`);
@@ -228,9 +309,48 @@ async function generateNapkinVisual(args) {
   throw new Error("Visual generation timed out after 24 seconds. Try a simpler prompt.");
 }
 
+// Download single image
+app.get('/download/:id', (req, res) => {
+  const { id } = req.params;
+  const img = imageStore.get(id);
+  
+  if (!img || img.type === 'bundle') {
+    return res.status(404).json({ error: 'Image not found or expired' });
+  }
+  
+  res.setHeader('Content-Type', img.mimeType);
+  res.setHeader('Content-Disposition', `attachment; filename="${img.filename}"`);
+  res.send(img.data);
+});
+
+// Download ZIP bundle
+app.get('/download/zip/:bundleId', (req, res) => {
+  const { bundleId } = req.params;
+  const bundle = imageStore.get(`bundle_${bundleId}`);
+  
+  if (!bundle || bundle.type !== 'bundle') {
+    return res.status(404).json({ error: 'Bundle not found or expired' });
+  }
+  
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="napkin_images_${bundleId.slice(0, 8)}.zip"`);
+  
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  archive.pipe(res);
+  
+  for (const imageId of bundle.imageIds) {
+    const img = imageStore.get(imageId);
+    if (img && img.type !== 'bundle') {
+      archive.append(img.data, { name: img.filename });
+    }
+  }
+  
+  archive.finalize();
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'napkin-mcp-bridge' });
+  res.json({ status: 'ok', service: 'napkin-mcp-bridge', storedImages: imageStore.size });
 });
 
 // MCP discovery endpoint (GET) - required for Claude.ai
@@ -238,7 +358,7 @@ app.get('/mcp', (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.json({
     name: "napkin-mcp-bridge",
-    version: "1.0.0",
+    version: "1.1.0",
     protocol_version: PROTOCOL_VERSION,
     capabilities: {
       tools: {}
@@ -309,19 +429,29 @@ app.get('/sse', (req, res) => {
   });
 });
 
-// Clean up old sessions
+// Clean up old sessions and images (1 hour expiry)
 setInterval(() => {
   const now = Date.now();
+  const oneHour = 3600000;
+  
   for (const [id, session] of sessions) {
-    if (now - session.created > 3600000) {
+    if (now - session.created > oneHour) {
       sessions.delete(id);
+    }
+  }
+  
+  for (const [id, item] of imageStore) {
+    if (now - item.created > oneHour) {
+      imageStore.delete(id);
     }
   }
 }, 60000);
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Napkin MCP bridge running on port ${PORT}`);
+  console.log(`Napkin MCP bridge v1.1.0 running on port ${PORT}`);
   console.log(`MCP endpoint: /mcp`);
   console.log(`Health check: /health`);
+  console.log(`Download endpoint: /download/:id`);
+  console.log(`ZIP bundle: /download/zip/:bundleId`);
 });
