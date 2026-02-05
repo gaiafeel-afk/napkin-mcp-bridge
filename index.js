@@ -150,14 +150,14 @@ async function generateNapkinVisual(args) {
     throw new Error("No request ID returned from Napkin API");
   }
 
-  // Step 2: Poll for completion (max 60 seconds)
-  const maxAttempts = 30;
+  // Step 2: Poll for completion (max 25 seconds to stay within MCP timeout)
+  const maxAttempts = 12;
   const pollInterval = 2000; // 2 seconds
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await sleep(pollInterval);
 
-    const statusResponse = await fetch(`https://api.napkin.ai/v1/visual/${requestId}`, {
+    const statusResponse = await fetch(`https://api.napkin.ai/v1/visual/${requestId}/status`, {
       method: "GET",
       headers: {
         "Authorization": `Bearer ${NAPKIN_API_KEY}`
@@ -187,7 +187,7 @@ async function generateNapkinVisual(args) {
     // Otherwise continue polling (status is "processing" or "pending")
   }
 
-  throw new Error("Visual generation timed out after 60 seconds");
+  throw new Error("Visual generation timed out after 24 seconds. The visual may still be processing - try a simpler prompt.");
 }
 
 // Health check endpoint
