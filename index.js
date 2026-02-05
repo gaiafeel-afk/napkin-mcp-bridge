@@ -84,14 +84,28 @@ async function handleMcpRequest(request, sessionId) {
       if (name === "generate_visual") {
         try {
           const result = await generateNapkinVisual(args);
-          return jsonRpcResponse(id, {
-            content: [
-              {
-                type: "text",
-                text: result
-              }
-            ]
-          });
+          
+          // Handle different return types (image vs text)
+          if (result.type === "image") {
+            return jsonRpcResponse(id, {
+              content: [
+                {
+                  type: "image",
+                  data: result.data,
+                  mimeType: result.mimeType
+                }
+              ]
+            });
+          } else if (result.type === "text") {
+            return jsonRpcResponse(id, {
+              content: [{ type: "text", text: result.text }]
+            });
+          } else {
+            // Legacy string return
+            return jsonRpcResponse(id, {
+              content: [{ type: "text", text: result }]
+            });
+          }
         } catch (error) {
           return jsonRpcResponse(id, {
             content: [
@@ -172,22 +186,46 @@ async function generateNapkinVisual(args) {
     const status = statusData.status;
 
     if (status === "completed") {
-      // Get the file URL
+      // Get the file URL and download with auth
+      let fileUrl = null;
       if (statusData.generated_files && statusData.generated_files.length > 0) {
-        const fileUrl = statusData.generated_files[0].url;
-        return `✅ Visual generated successfully!\n\n🔗 View your visual: ${fileUrl}\n\n⚠️ Note: This URL expires in 30 minutes. Download the image if you need to keep it.`;
+        fileUrl = statusData.generated_files[0].url;
       } else if (statusData.url) {
-        return `✅ Visual generated successfully!\n\n🔗 View your visual: ${statusData.url}\n\n⚠️ Note: This URL expires in 30 minutes.`;
-      } else {
-        return `✅ Visual completed but no download URL found. Response: ${JSON.stringify(statusData)}`;
+        fileUrl = statusData.url;
       }
+      
+      if (!fileUrl) {
+        return { type: "text", text: `✅ Visual completed but no download URL found. Response: ${JSON.stringify(statusData)}` };
+      }
+
+      // Download the file with auth header
+      const fileResponse = await fetch(fileUrl, {
+        headers: {
+          "Authorization": `Bearer ${NAPKIN_API_KEY}`
+        }
+      });
+
+      if (!fileResponse.ok) {
+        return { type: "text", text: `✅ Visual generated but failed to download: ${fileResponse.status}. URL: ${fileUrl}` };
+      }
+
+      const contentType = fileResponse.headers.get('content-type') || 'image/png';
+      const arrayBuffer = await fileResponse.arrayBuffer();
+      const base64 = Buffer.from(arrayBuffer).toString('base64');
+      
+      // Return as image for MCP
+      return {
+        type: "image",
+        data: base64,
+        mimeType: contentType.split(';')[0]
+      };
     } else if (status === "failed" || status === "error") {
       throw new Error(`Visual generation failed: ${statusData.error || "Unknown error"}`);
     }
     // Otherwise continue polling (status is "processing" or "pending")
   }
 
-  throw new Error("Visual generation timed out after 24 seconds. The visual may still be processing - try a simpler prompt.");
+  throw new Error("Visual generation timed out after 24 seconds. Try a simpler prompt.");
 }
 
 // Health check endpoint
