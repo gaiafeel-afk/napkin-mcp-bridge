@@ -31,7 +31,7 @@ const TOOLS = [
         },
         visual_type: {
           type: "string",
-          description: "Type of visual to generate",
+          description: "Type of visual to generate (optional hint)",
           enum: ["mindmap", "flowchart", "timeline", "comparison", "infographic", "diagram"]
         },
         format: {
@@ -73,7 +73,6 @@ async function handleMcpRequest(request, sessionId) {
       });
 
     case "notifications/initialized":
-      // This is a notification, no response needed
       return null;
 
     case "tools/list":
@@ -116,11 +115,17 @@ async function handleMcpRequest(request, sessionId) {
   }
 }
 
-// Call Napkin AI API
+// Sleep helper
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Call Napkin AI API (async with polling)
 async function generateNapkinVisual(args) {
   const { content, visual_type, format = "svg" } = args;
 
-  const response = await fetch("https://api.napkin.ai/v1/image-generation/generate", {
+  // Step 1: Create visual request
+  const createResponse = await fetch("https://api.napkin.ai/v1/visual", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${NAPKIN_API_KEY}`,
@@ -128,26 +133,61 @@ async function generateNapkinVisual(args) {
     },
     body: JSON.stringify({
       content: content,
-      visual_query: visual_type || "auto",
-      format: format
+      format: format,
+      ...(visual_type && { visual_query: visual_type })
     })
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Napkin API error (${response.status}): ${errorText}`);
+  if (!createResponse.ok) {
+    const errorText = await createResponse.text();
+    throw new Error(`Napkin API error (${createResponse.status}): ${errorText}`);
   }
 
-  const data = await response.json();
-  
-  // Return the URL or content
-  if (data.url) {
-    return `Visual generated successfully!\n\nView your visual: ${data.url}`;
-  } else if (data.generated_files && data.generated_files.length > 0) {
-    return `Visual generated successfully!\n\nView your visual: ${data.generated_files[0].url}`;
-  } else {
-    return `Visual generation started. Status: ${data.status || 'processing'}`;
+  const createData = await createResponse.json();
+  const requestId = createData.id || createData.request_id;
+
+  if (!requestId) {
+    throw new Error("No request ID returned from Napkin API");
   }
+
+  // Step 2: Poll for completion (max 60 seconds)
+  const maxAttempts = 30;
+  const pollInterval = 2000; // 2 seconds
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    await sleep(pollInterval);
+
+    const statusResponse = await fetch(`https://api.napkin.ai/v1/visual/${requestId}`, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${NAPKIN_API_KEY}`
+      }
+    });
+
+    if (!statusResponse.ok) {
+      continue; // Retry on error
+    }
+
+    const statusData = await statusResponse.json();
+    const status = statusData.status;
+
+    if (status === "completed") {
+      // Get the file URL
+      if (statusData.generated_files && statusData.generated_files.length > 0) {
+        const fileUrl = statusData.generated_files[0].url;
+        return `✅ Visual generated successfully!\n\n🔗 View your visual: ${fileUrl}\n\n⚠️ Note: This URL expires in 30 minutes. Download the image if you need to keep it.`;
+      } else if (statusData.url) {
+        return `✅ Visual generated successfully!\n\n🔗 View your visual: ${statusData.url}\n\n⚠️ Note: This URL expires in 30 minutes.`;
+      } else {
+        return `✅ Visual completed but no download URL found. Response: ${JSON.stringify(statusData)}`;
+      }
+    } else if (status === "failed" || status === "error") {
+      throw new Error(`Visual generation failed: ${statusData.error || "Unknown error"}`);
+    }
+    // Otherwise continue polling (status is "processing" or "pending")
+  }
+
+  throw new Error("Visual generation timed out after 60 seconds");
 }
 
 // Health check endpoint
@@ -170,7 +210,6 @@ app.get('/mcp', (req, res) => {
 
 // MCP endpoint - Streamable HTTP transport
 app.post('/mcp', async (req, res) => {
-  // Get or create session
   let sessionId = req.headers['mcp-session-id'];
   
   if (!sessionId) {
@@ -187,7 +226,6 @@ app.post('/mcp', async (req, res) => {
   try {
     const request = req.body;
     
-    // Handle batch requests
     if (Array.isArray(request)) {
       const responses = [];
       for (const req of request) {
@@ -199,11 +237,9 @@ app.post('/mcp', async (req, res) => {
       return res.json(responses);
     }
     
-    // Handle single request
     const response = await handleMcpRequest(request, sessionId);
     
     if (response === null) {
-      // Notification - return 204 No Content
       return res.status(204).end();
     }
     
@@ -223,10 +259,8 @@ app.get('/sse', (req, res) => {
   const sessionId = randomUUID();
   sessions.set(sessionId, { created: Date.now(), res });
   
-  // Send initial endpoint event
   res.write(`event: endpoint\ndata: /mcp?sessionId=${sessionId}\n\n`);
   
-  // Keep alive
   const keepAlive = setInterval(() => {
     res.write(': keepalive\n\n');
   }, 30000);
@@ -237,11 +271,11 @@ app.get('/sse', (req, res) => {
   });
 });
 
-// Clean up old sessions periodically
+// Clean up old sessions
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions) {
-    if (now - session.created > 3600000) { // 1 hour
+    if (now - session.created > 3600000) {
       sessions.delete(id);
     }
   }
@@ -251,5 +285,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Napkin MCP bridge running on port ${PORT}`);
   console.log(`MCP endpoint: /mcp`);
-  console.log(`SSE endpoint: /sse`);
+  console.log(`Health check: /health`);
 });
